@@ -361,7 +361,9 @@ list(APPEND kyty_emulator_src
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
 if (KYTY_CLANG_CL)
-	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
+	# Line tables go to kyty_emulator.pdb only, so profiles of release builds resolve to file and
+	# line, including inlined frames. Debug info does not change the generated code.
+	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED -gline-tables-only")
 endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak)
