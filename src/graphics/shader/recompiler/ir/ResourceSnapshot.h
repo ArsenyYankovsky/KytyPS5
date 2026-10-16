@@ -28,11 +28,22 @@ struct UniformFill {
 	bool operator==(const UniformFill&) const = default;
 };
 
+// A flat SRT dword that the GPU copies from guest memory instead of the refresh reading it.
+struct GpuSrtFill {
+	uint64_t address     = 0;
+	uint32_t flat_offset = 0;
+
+	bool operator==(const GpuSrtFill&) const = default;
+};
+
 struct ResourceSnapshot {
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
 	std::vector<DescriptorValue> samplers;
 	std::vector<uint32_t>        flattened_srt;
+	// Slots of flattened_srt left at zero by the refresh: their bytes were GPU-written and only
+	// the shader reads them, so the renderer copies them on the GPU (see SrtRuntime::gpu_written).
+	std::vector<GpuSrtFill>      gpu_srt_fills;
 	std::vector<uint32_t>        user_data;
 	UniformFill                 uniform_fill;
 };

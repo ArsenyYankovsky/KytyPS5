@@ -140,6 +140,21 @@ bool ReadShaderGuestMemoryOnGpuThread(void*, uint64_t address, std::span<uint32_
 	return true;
 }
 
+// Flat SRT slots that only the shader reads, in bytes a compute pass just wrote, are copied into
+// the flat buffer on the GPU (see RenderExecutor::RebindBuffers) instead of waiting for the GPU to
+// drain so the CPU can read them. KYTY_SRT_GPU_FILL=0 reads them on the CPU as before.
+bool ShaderGuestMemoryGpuWritten(void*, uint64_t address, uint64_t size) {
+	return Libs::LibKernel::Memory::IsGpuCopyableGpuWriteOnGpuThread(address, size);
+}
+
+ShaderRecompiler::IR::SrtGpuWrittenQuery SrtGpuFillQuery() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_SRT_GPU_FILL");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	return enabled ? ShaderGuestMemoryGpuWritten : nullptr;
+}
+
 // A whole 64-byte block for the reads above, when each of them would be a plain copy.
 bool ReadShaderGuestBlockOnGpuThread(void*, uint64_t address, std::span<uint32_t> values) {
 	return Libs::LibKernel::Memory::TryReadGuestPlainOnGpuThread(address, values.data(),
@@ -654,6 +669,7 @@ struct PipelineCache::ProgramCache {
 		    // TryReadGpuCleanBacking fails for a range when any byte is GPU-dirty or unbacked.
 		    .specialization_block_reads = true,
 		    .read_memory_block          = ReadShaderGuestBlockOnGpuThread,
+		    .gpu_written                = SrtGpuFillQuery(),
 		};
 		// Refreshes a known source and returns its permutation for the refreshed specialization,
 		// if it has one yet.

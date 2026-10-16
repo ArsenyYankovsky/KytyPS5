@@ -19,6 +19,8 @@
 #include "graphics/host_gpu/renderer/commandHooks.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
+#include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -960,6 +962,97 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+// Uploads the flat SRT. The slots the refresh left to the GPU (ResourceSnapshot::gpu_srt_fills)
+// are then copied from the cached buffer holding the GPU's writes: after the commands that wrote
+// them and before the draw that reads them, with no wait for the GPU. Slots whose bytes no cached
+// buffer holds whole any more (a buffer join since the refresh) are read on the CPU instead, as
+// the refresh would have.
+static vk::DescriptorBufferInfo
+UploadFlattenedSrt(RenderContext& context, const ShaderRecompiler::IR::ResourceSnapshot& snapshot) {
+	const auto& fills = snapshot.gpu_srt_fills;
+	if (fills.empty()) {
+		return NativeUpload(context, snapshot.flattened_srt);
+	}
+	struct FillCopy {
+		uint64_t address     = 0;
+		uint32_t flat_offset = 0;
+		uint32_t dwords      = 0;
+		Buffer*  source      = nullptr;
+		uint64_t offset      = 0;
+	};
+	thread_local std::vector<FillCopy> copies;
+	thread_local std::vector<uint32_t> read_on_cpu;
+	copies.clear();
+	for (const auto& fill: fills) {
+		EXIT_IF(fill.flat_offset >= snapshot.flattened_srt.size());
+		if (!copies.empty()) {
+			auto& last = copies.back();
+			if (fill.flat_offset == last.flat_offset + last.dwords &&
+			    fill.address == last.address + uint64_t {last.dwords} * 4u) {
+				last.dwords++;
+				continue;
+			}
+		}
+		copies.push_back({.address = fill.address, .flat_offset = fill.flat_offset, .dwords = 1});
+	}
+	auto&    buffers    = context.GetBufferCache();
+	bool     cpu_read   = false;
+	uint64_t gpu_dwords = 0;
+	for (auto& copy: copies) {
+		const auto size = uint64_t {copy.dwords} * 4u;
+		const auto id   = buffers.FindCoveringBuffer(copy.address, size);
+		if (id) {
+			// Uploads bytes of the range that the CPU wrote since; never a stream copy, as the
+			// range holds GPU-written bytes.
+			auto [source, offset] = buffers.ObtainBuffer(copy.address, size, false, false, id);
+			if (source == &buffers.GetBuffer(id)) {
+				copy.source = source;
+				copy.offset = offset;
+				gpu_dwords += copy.dwords;
+				continue;
+			}
+		}
+		if (!cpu_read) {
+			read_on_cpu.assign(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
+			cpu_read = true;
+		}
+		Libs::LibKernel::Memory::ReadGuestOnGpuThread(copy.address,
+		                                              read_on_cpu.data() + copy.flat_offset, size);
+		DrainStats::Record(DrainStats::Kind::SrtGpuFillCpu, copy.dwords);
+	}
+	const auto info = cpu_read ? NativeUpload(context, read_on_cpu)
+	                           : NativeUpload(context, snapshot.flattened_srt);
+	if (gpu_dwords == 0) {
+		return info;
+	}
+	auto& command = context.GetCommandScheduler().Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	GpuZones::Mark(native, DrainStats::Zone::BufferCopy);
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                       nullptr);
+	for (const auto& copy: copies) {
+		if (copy.source == nullptr) {
+			continue;
+		}
+		const vk::BufferCopy region {copy.offset, info.offset + uint64_t {copy.flat_offset} * 4u,
+		                             uint64_t {copy.dwords} * 4u};
+		native.copyBuffer(copy.source->Handle(), info.buffer, 1, &region);
+		DrainStats::Record(DrainStats::Kind::SrtGpuFill, copy.dwords);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
+	                       nullptr);
+	return info;
+}
+
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	auto& image = m_context.GetTextureCache().GetImage(id);
 	if (image.info.data.Empty()) {
@@ -1278,7 +1371,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	g_draw_phases.Mark(DrawPhaseTimer::BufferViews);
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		prepared.flattened_srt = UploadFlattenedSrt(m_context, snapshot);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {

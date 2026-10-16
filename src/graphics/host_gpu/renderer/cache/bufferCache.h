@@ -91,6 +91,11 @@ public:
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
+	// The cached buffer that holds all of the range, or an invalid id; never creates one.
+	[[nodiscard]] BufferId FindCoveringBuffer(uint64_t vaddr, uint64_t size);
+	// The range holds GPU-written bytes that a CPU read would wait for, and one cached buffer
+	// holds all of it (no image), so a GPU copy from that buffer reads them without waiting.
+	[[nodiscard]] bool IsGpuCopyableGpuWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);

@@ -16,6 +16,7 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
+	runtime.gpu_written = nullptr;
 	if (runtime.read_specialization_memory != nullptr) {
 		runtime.read_memory = runtime.read_specialization_memory;
 		runtime.userdata    = SpecializationUserdata(runtime);
@@ -1438,6 +1439,80 @@ void BuildFlatRuns(const ResourcePlan& program, CompiledResourcePlan& compiled) 
 	}
 }
 
+// A refresh evaluates a slot on the host when a descriptor, an indirect image key, a condition,
+// the uniform fill or the address of any slot's read reads it. The other ordinary slots feed only
+// the translated shader, through the flat SRT buffer.
+void AnalyzeGpuFillableSlots(const ResourcePlan& program, CompiledResourcePlan& compiled) {
+	const auto            count = compiled.slots.size();
+	std::vector<uint8_t>  host(count, 0u);
+	std::vector<uint8_t>  visited(compiled.nodes.size(), 0u);
+	std::vector<uint32_t> pending;
+	// A host value may also use a slot's read node itself rather than its ReadConst.
+	std::vector<uint32_t> slot_of(compiled.nodes.size(), ResourceNode::NoNode);
+	for (uint32_t slot = 0; slot < count; slot++) {
+		if (compiled.slots[slot] < slot_of.size()) {
+			slot_of[compiled.slots[slot]] = slot;
+		}
+	}
+	const auto push = [&](uint32_t index) {
+		if (index < visited.size() && visited[index] == 0u) {
+			visited[index] = 1u;
+			pending.push_back(index);
+		}
+	};
+	for (const auto& dwords: compiled.descriptors) {
+		for (const auto index: dwords) {
+			push(index);
+		}
+	}
+	for (auto* roots: {&compiled.key_counts, &compiled.selector_masks, &compiled.conditions}) {
+		for (const auto index: *roots) {
+			push(index);
+		}
+	}
+	for (const auto index: compiled.fill) {
+		push(index);
+	}
+	for (const auto slot: compiled.slots) {
+		if (slot < compiled.nodes.size()) {
+			for (const auto arg: compiled.nodes[slot].args) {
+				push(arg);
+			}
+		}
+	}
+	while (!pending.empty()) {
+		const auto  index = pending.back();
+		const auto& node  = compiled.nodes[index];
+		pending.pop_back();
+		if (slot_of[index] != ResourceNode::NoNode) {
+			host[slot_of[index]] = 1u;
+		}
+		if (node.op == NodeOp::ReadConst && node.aux < count) {
+			host[node.aux]         = 1u;
+			const auto flat_offset = program.srt_reads[node.aux].flat_offset;
+			if (flat_offset < count) {
+				host[flat_offset] = 1u;
+			}
+		}
+		for (const auto arg: node.args) {
+			push(arg);
+		}
+	}
+	compiled.gpu_fillable.assign(count, 0u);
+	for (uint32_t slot = 0; slot < count; slot++) {
+		const auto flat_offset = program.srt_reads[slot].flat_offset;
+		const auto index       = compiled.slots[slot];
+		if (host[slot] != 0u || flat_offset >= count || host[flat_offset] != 0u ||
+		    index >= compiled.nodes.size() ||
+		    (flat_offset < compiled.clean_slots.size() &&
+		     compiled.clean_slots[flat_offset] != 0u)) {
+			continue;
+		}
+		const auto op               = compiled.nodes[index].op;
+		compiled.gpu_fillable[slot] = op == NodeOp::RawAddress || op == NodeOp::RawBuffer ? 1u : 0u;
+	}
+}
+
 } // namespace
 
 void SetFlatRunReads(bool enabled) {
@@ -1501,6 +1576,7 @@ const CompiledResourcePlan& CompileResourcePlan(const ResourcePlan& program) {
 	AnalyzeControlFlow(program, *compiled);
 	AnalyzeMemo(program, *compiled);
 	BuildFlatRuns(program, *compiled);
+	AnalyzeGpuFillableSlots(program, *compiled);
 	program.compiled = std::move(compiled);
 	return *program.compiled;
 }
@@ -1565,6 +1641,23 @@ bool SrtEvaluator::EvaluateWide(uint32_t index, uint64_t& result) {
 }
 
 bool SrtEvaluator::EvaluateRawRead(const ResourceNode& node, uint64_t& result) {
+	uint64_t address = 0;
+	if (!RawReadAddress(node, address)) {
+		return false;
+	}
+	uint32_t word = 0;
+	if (m_runtime.read_memory != nullptr) {
+		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
+			return false;
+		}
+	} else {
+		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+	}
+	result = word;
+	return true;
+}
+
+bool SrtEvaluator::RawReadAddress(const ResourceNode& node, uint64_t& address) {
 	uint64_t low    = 0;
 	uint64_t high   = 0;
 	uint64_t offset = 0;
@@ -1574,7 +1667,7 @@ bool SrtEvaluator::EvaluateRawRead(const ResourceNode& node, uint64_t& result) {
 	}
 	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
 	const auto immediate = static_cast<int64_t>(node.imm);
-	uint64_t   address   = 0;
+	address              = 0;
 	if (node.op == NodeOp::RawBuffer) {
 		uint64_t records = 0;
 		uint64_t word3   = 0;
@@ -1603,15 +1696,6 @@ bool SrtEvaluator::EvaluateRawRead(const ResourceNode& node, uint64_t& result) {
 			return false;
 		}
 	}
-	uint32_t word = 0;
-	if (m_runtime.read_memory != nullptr) {
-		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
-			return false;
-		}
-	} else {
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
-	}
-	result = word;
 	return true;
 }
 
@@ -2039,21 +2123,37 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 	return active;
 }
 
-bool SrtEvaluator::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+bool SrtEvaluator::RefreshFlatBuffer(std::vector<uint32_t>& flat, std::vector<GpuSrtFill>* fills) {
+	if (fills != nullptr) {
+		fills->clear();
+	}
 	if (!m_program.srt_plan_complete) {
 		return false;
 	}
 	flat.resize(m_program.srt_reads.size());
+	// Only this walker's own slots are left to the GPU; nested EXEC walkers read as before.
+	const bool defer = fills != nullptr && m_runtime.gpu_written != nullptr &&
+	                   m_active_mask == ResourceNode::NoNode &&
+	                   m_compiled.gpu_fillable.size() == m_program.srt_reads.size();
 	// Run slots are ordinary: this walker evaluates them. A run that cannot be read whole
 	// evaluates its slots one by one, and fails exactly as that would.
 	const bool runs = !m_compiled.flat_runs.empty() && m_active_mask == ResourceNode::NoNode;
 	for (uint32_t run = 0; runs && run < m_compiled.flat_runs.size(); run++) {
-		const auto& info = m_compiled.flat_runs[run];
-		if (ReadFlatRun(info, flat)) {
+		const auto& info    = m_compiled.flat_runs[run];
+		bool        written = false;
+		if (defer && DeferFlatRun(info, flat, *fills, written)) {
+			continue;
+		}
+		// A GPU-written run with slots the host reads goes slot by slot: those slots read their
+		// own bytes, which may be clean, and the others are left to the GPU.
+		if (!written && ReadFlatRun(info, flat)) {
 			continue;
 		}
 		for (uint32_t index = 0; index < info.count; index++) {
 			const auto slot = m_compiled.run_entries[info.first + index].slot;
+			if (defer && DeferSlot(slot, flat, *fills)) {
+				continue;
+			}
 			if (!Evaluate(m_compiled.slots[slot], flat[m_program.srt_reads[slot].flat_offset])) {
 				return false;
 			}
@@ -2070,6 +2170,9 @@ bool SrtEvaluator::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		    (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
 			return false;
 		}
+		if (defer && !clean && DeferSlot(slot, flat, *fills)) {
+			continue;
+		}
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
 		if (offset >= flat.size() || !evaluator.Evaluate(m_compiled.slots[slot], flat[offset])) {
 			return false;
@@ -2082,8 +2185,8 @@ bool SrtEvaluator::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	return true;
 }
 
-bool SrtEvaluator::ReadFlatRun(const CompiledResourcePlan::FlatRun& run,
-                               std::vector<uint32_t>& flat) {
+bool SrtEvaluator::FlatRunRange(const CompiledResourcePlan::FlatRun& run, uint64_t& first,
+                                uint64_t& last) {
 	const auto* entries = m_compiled.run_entries.data() + run.first;
 	const auto& node    = m_nodes[m_compiled.slots[entries[0].slot]];
 	uint64_t    low     = 0;
@@ -2098,10 +2201,56 @@ bool SrtEvaluator::ReadFlatRun(const CompiledResourcePlan::FlatRun& run,
 	const auto relative = static_cast<int64_t>(node.imm) +
 	                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 	const auto span     = static_cast<int64_t>(run.dwords - 1u) * 4;
-	uint64_t   first    = 0;
-	uint64_t   last     = 0;
-	if (!AddSignedAddress(base, relative, first) || !AddSignedAddress(base, relative + span, last) ||
-	    last - first != static_cast<uint64_t>(span)) {
+	return AddSignedAddress(base, relative, first) &&
+	       AddSignedAddress(base, relative + span, last) &&
+	       last - first == static_cast<uint64_t>(span);
+}
+
+bool SrtEvaluator::DeferFlatRun(const CompiledResourcePlan::FlatRun& run,
+                                std::vector<uint32_t>& flat, std::vector<GpuSrtFill>& fills,
+                                bool& written) {
+	const auto* entries = m_compiled.run_entries.data() + run.first;
+	uint64_t    first   = 0;
+	uint64_t    last    = 0;
+	written             = FlatRunRange(run, first, last) &&
+	                      m_runtime.gpu_written(m_runtime.gpu_written_userdata, first,
+	                                            last - first + sizeof(uint32_t));
+	if (!written) {
+		return false;
+	}
+	for (uint32_t index = 0; index < run.count; index++) {
+		if (m_compiled.gpu_fillable[entries[index].slot] == 0u) {
+			return false;
+		}
+	}
+	for (uint32_t index = 0; index < run.count; index++) {
+		flat[entries[index].flat_offset] = 0;
+		fills.push_back({first + uint64_t {entries[index].dword} * 4u, entries[index].flat_offset});
+	}
+	return true;
+}
+
+bool SrtEvaluator::DeferSlot(uint32_t slot, std::vector<uint32_t>& flat,
+                             std::vector<GpuSrtFill>& fills) {
+	const auto offset  = m_program.srt_reads[slot].flat_offset;
+	uint64_t   address = 0;
+	// A read that would fail is left to evaluation, which fails the same way.
+	if (m_compiled.gpu_fillable[slot] == 0u || offset >= flat.size() ||
+	    !RawReadAddress(m_nodes[m_compiled.slots[slot]], address) ||
+	    !m_runtime.gpu_written(m_runtime.gpu_written_userdata, address, sizeof(uint32_t))) {
+		return false;
+	}
+	flat[offset] = 0;
+	fills.push_back({address, offset});
+	return true;
+}
+
+bool SrtEvaluator::ReadFlatRun(const CompiledResourcePlan::FlatRun& run,
+                               std::vector<uint32_t>&               flat) {
+	const auto* entries = m_compiled.run_entries.data() + run.first;
+	uint64_t    first   = 0;
+	uint64_t    last    = 0;
+	if (!FlatRunRange(run, first, last)) {
 		return false;
 	}
 	// One read per 64-byte block, as dword reads through a block cache would see memory.

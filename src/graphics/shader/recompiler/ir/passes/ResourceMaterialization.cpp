@@ -1140,6 +1140,8 @@ private:
 SrtRuntime ObservedRuntime(const SrtRuntime& runtime, bool capture_reads, ReadCapture& capture) {
 	SrtRuntime observed = runtime;
 	if (capture_reads) {
+		// Captured ranges must include every slot read.
+		observed.gpu_written = nullptr;
 		capture.ranges.clear();
 		observed.userdata = &capture;
 		observed.specialization_userdata = nullptr;
@@ -1194,8 +1196,15 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 	auto& reads = program.ThreadScratch().specialization_reads;
 	// The ordinary walker sends conditions that are not direct to its strict walker.
 	const auto active = walker.FindActiveSources();
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
-		return false;
+	if constexpr (std::is_same_v<Roots, CompiledRoots>) {
+		if (!walker.RefreshFlatBuffer(snapshot.flattened_srt, &snapshot.gpu_srt_fills)) {
+			return false;
+		}
+	} else {
+		snapshot.gpu_srt_fills.clear();
+		if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
+			return false;
+		}
 	}
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
@@ -1507,6 +1516,12 @@ bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                           MaterializationMemo* memo) {
+	if (g_verify_materialization && runtime.gpu_written != nullptr) {
+		// The reference walker reads every slot, so it compares only refreshes that do too.
+		auto exact        = runtime;
+		exact.gpu_written = nullptr;
+		return MaterializeResources(program, exact, snapshot, specialization, memo);
+	}
 	const bool result = MaterializeCompiled(program, runtime, snapshot, specialization, memo);
 	if (g_verify_materialization) {
 		VerifyMaterialization(program, runtime, snapshot, specialization, result,

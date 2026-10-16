@@ -1542,6 +1542,23 @@ TextureCache::MaterializeColorClearNow(ImageId id, const ImageDesc& desc,
 	return ColorClearOutcome::Other;
 }
 
+// With drain stats, logs the first GPU DCC checks refused for each reason: every refusal of
+// GPU-written metadata costs the CPU path's drain.
+static void NoteDccGpuDecline(const TextureCache::ImageDesc& desc, uint32_t count, uint32_t reason,
+                              const char* text) {
+	static std::array<std::atomic<uint32_t>, 4> printed {};
+	if (!DrainStats::Enabled() || reason >= printed.size() ||
+	    printed[reason].fetch_add(1, std::memory_order_relaxed) >= 4) {
+		return;
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "dcc-gpu-clear declined: {} image=0x{:x} binding={} format={} level={} layers={}+{} "
+	    "volume={}\n",
+	    text, desc.info.data.address, static_cast<int>(desc.type),
+	    static_cast<int>(desc.view_info.format), desc.view_info.base_level,
+	    desc.view_info.base_layer, count, desc.info.IsVolume() ? 1 : 0));
+}
+
 bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
                                             uint64_t slices_address, uint64_t slice_size,
                                             uint32_t image_first, uint32_t count, bool* no_op) {
@@ -1571,17 +1588,30 @@ bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
 		}
 		return true;
 	}
-	// Render targets and sampled textures: both consume the keys (as the CPU path does), so each
-	// GPU write is checked once. A texture qualifies when its image can already be a color
-	// attachment, as a render target the game fast-clears and then samples without drawing to it
-	// first: on the CPU path each such lookup drained the GPU (once a frame near Astro Bot's
-	// crashed ship, waiting about 25 ms behind the frame's heaviest draw).
+	// Render targets, sampled textures and storage images: all consume the keys (as the CPU path
+	// does), so each GPU write is checked once. A texture or storage image qualifies when its
+	// image can already be a color attachment, as a render target the game fast-clears and then
+	// samples or a compute pass binds without drawing to it first: on the CPU path each such
+	// lookup drained the GPU (once a frame near Astro Bot's crashed ship, waiting about 25 ms
+	// behind the frame's heaviest draw; once a frame in Demon's Souls, about 5.6 ms, from a
+	// compute dispatch). KYTY_DCC_GPU_STORAGE=0 sends storage images to the CPU path again.
+	static const bool storage = [] {
+		const char* text = std::getenv("KYTY_DCC_GPU_STORAGE");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
 	const auto& view = desc.view_info;
-	if ((desc.type != BindingType::RenderTarget && desc.type != BindingType::Texture) ||
-	    desc.info.IsVolume() ||
-	    count > DccClearResolver::MaxSlices || view.base_level != 0 ||
-	    !(m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
+	if (desc.type != BindingType::RenderTarget && desc.type != BindingType::Texture &&
+	    !(storage && desc.type == BindingType::Storage)) {
+		NoteDccGpuDecline(desc, count, 0, "binding");
+		return false;
+	}
+	if (desc.info.IsVolume() || count > DccClearResolver::MaxSlices || view.base_level != 0) {
+		NoteDccGpuDecline(desc, count, 1, "view");
+		return false;
+	}
+	if (!(m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
 	      vk::FormatFeatureFlagBits::eColorAttachment)) {
+		NoteDccGpuDecline(desc, count, 2, "format");
 		return false;
 	}
 	{
@@ -1590,6 +1620,7 @@ bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
 		if (image.depth_id || image.backing.image == nullptr ||
 		    !(image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment) ||
 		    image_first >= image.backing.layers || count > image.backing.layers - image_first) {
+			NoteDccGpuDecline(desc, count, 3, "image");
 			return false;
 		}
 	}

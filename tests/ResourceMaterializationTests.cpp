@@ -1,10 +1,12 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <vector>
 
 namespace {
 
@@ -261,11 +263,20 @@ struct TableMemory {
   }
 
   uint32_t direct_reads = 0;
+  std::vector<uint64_t> read_addresses; // Each dword DirectRead was asked for.
 
   static bool DirectRead(void *userdata, uint64_t address,
                          std::span<uint32_t> values) {
-    static_cast<TableMemory *>(userdata)->direct_reads++;
+    auto &memory = *static_cast<TableMemory *>(userdata);
+    memory.direct_reads++;
+    for (size_t i = 0; i < values.size(); i++) {
+      memory.read_addresses.push_back(address + i * 4u);
+    }
     return Read(userdata, address, values);
+  }
+
+  [[nodiscard]] bool WasRead(uint64_t address) const {
+    return std::ranges::find(read_addresses, address) != read_addresses.end();
   }
 
   static bool Read(void *userdata, uint64_t address,
@@ -379,6 +390,17 @@ MemoPlan(MemoPlanExtra extra, bool condition) {
   return plan;
 }
 
+// Guest bytes [begin, end) that the GPU wrote, for SrtRuntime::gpu_written.
+struct GpuWrittenRange {
+  uint64_t begin = 0;
+  uint64_t end = 0;
+
+  static bool Query(void *userdata, uint64_t address, uint64_t size) {
+    const auto &range = *static_cast<const GpuWrittenRange *>(userdata);
+    return address < range.end && address + size > range.begin;
+  }
+};
+
 struct MemoFixture {
   TableMemory memory;
   std::array<uint32_t, 4> user_data{};
@@ -396,16 +418,90 @@ struct MemoFixture {
 
   bool block_reads = false;
 
-  bool Refresh(const Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan) {
+  bool Refresh(const Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan,
+               GpuWrittenRange *written = nullptr) {
     using namespace Libs::Graphics::ShaderRecompiler::IR;
-    const SrtRuntime runtime{.user_data = user_data,
-                             .read_memory = TableMemory::DirectRead,
-                             .userdata = &memory,
-                             .read_specialization_memory = TableMemory::StrictRead,
-                             .specialization_block_reads = block_reads};
+    const SrtRuntime runtime{
+        .user_data = user_data,
+        .read_memory = TableMemory::DirectRead,
+        .userdata = &memory,
+        .read_specialization_memory = TableMemory::StrictRead,
+        .specialization_block_reads = block_reads,
+        .gpu_written = written != nullptr ? GpuWrittenRange::Query : nullptr,
+        .gpu_written_userdata = written};
     return MaterializeResources(plan, runtime, snapshot, specialization, &memo);
   }
 };
+
+void TestGpuWrittenShaderSlotsAreFilledOnGpu() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // The reference walker reads every slot, and these refreshes leave some to
+  // the GPU, so they are checked by hand.
+  SetResourceMaterializationVerification(false);
+  const auto plan = MemoPlan(MemoPlanExtra::None, false);
+  const auto &compiled = CompileResourcePlan(plan);
+  Check(compiled.gpu_fillable == std::vector<uint8_t>{0u, 0u, 0u, 0u, 1u},
+        "only the slot no descriptor reads should be GPU-fillable");
+  const uint64_t slot4 = TableMemory::Base + 16u;
+  // Only slot 4 GPU-written, then the whole table: descriptor slots beside it
+  // read their own bytes either way.
+  for (const bool whole_table : {false, true}) {
+    MemoFixture fixture;
+    fixture.memory.words[4] = 0x4444u;
+    GpuWrittenRange written{whole_table ? TableMemory::Base : slot4,
+                            whole_table ? TableMemory::Base +
+                                              sizeof(fixture.memory.words)
+                                        : slot4 + 4u};
+    Check(fixture.Refresh(plan, &written), "GPU-written refresh failed");
+    Check(fixture.snapshot.gpu_srt_fills ==
+              std::vector<GpuSrtFill>{{.address = slot4, .flat_offset = 4}},
+          "the GPU-written shader slot was not left to the GPU");
+    Check(fixture.snapshot.flattened_srt[4] == 0u &&
+              !fixture.memory.WasRead(slot4),
+          "a slot left to the GPU was read");
+    Check(fixture.snapshot.buffers[0].dwords[1] == 0x1001u &&
+              fixture.snapshot.flattened_srt[1] == 0x1001u,
+          "descriptor slots beside a GPU-filled slot were misread");
+    // A refresh the memo serves lists the fill again.
+    Check(fixture.Refresh(plan, &written) && fixture.memo.reused &&
+              fixture.snapshot.gpu_srt_fills.size() == 1u,
+          "a memoized refresh dropped its GPU fill");
+  }
+  {
+    // Bytes the GPU did not write are read as before.
+    MemoFixture fixture;
+    fixture.memory.words[4] = 0x4444u;
+    GpuWrittenRange written{};
+    Check(fixture.Refresh(plan, &written) &&
+              fixture.snapshot.gpu_srt_fills.empty() &&
+              fixture.snapshot.flattened_srt[4] == 0x4444u,
+          "a clean shader slot was not read");
+  }
+  {
+    // A slot that a branch condition reads stays on the host.
+    const auto condition_plan = MemoPlan(MemoPlanExtra::None, true);
+    Check(CompileResourcePlan(condition_plan).gpu_fillable ==
+              std::vector<uint8_t>(5, 0u),
+          "a condition slot was GPU-fillable");
+    MemoFixture fixture;
+    fixture.memory.words[4] = 1u;
+    GpuWrittenRange written{TableMemory::Base,
+                            TableMemory::Base + sizeof(fixture.memory.words)};
+    Check(fixture.Refresh(condition_plan, &written) &&
+              fixture.snapshot.gpu_srt_fills.empty() &&
+              fixture.snapshot.flattened_srt[4] == 1u &&
+              fixture.snapshot.buffers[0].dwords[0] != 0u,
+          "a condition slot was left to the GPU");
+  }
+  {
+    // A predicate over slots 2 and 3 keeps them on the host.
+    const auto predicate_plan = MemoPlan(MemoPlanExtra::MemoryPredicate, false);
+    Check(CompileResourcePlan(predicate_plan).gpu_fillable ==
+              std::vector<uint8_t>{0u, 0u, 0u, 0u, 1u},
+          "a predicate slot was GPU-fillable");
+  }
+  SetResourceMaterializationVerification(true);
+}
 
 void TestCleanBlockReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
@@ -613,6 +709,7 @@ int main() {
   TestMemoRejectsUntrackedInputs();
   TestCleanBlockReads();
   TestDirectConditions();
+  TestGpuWrittenShaderSlotsAreFilledOnGpu();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

@@ -927,6 +927,24 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	return address + m_slot_buffers[id].Size() > vaddr;
 }
 
+BufferId BufferCache::FindCoveringBuffer(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return {};
+	}
+	// Buffers never overlap: only the last one beginning at or before vaddr can cover it.
+	const auto candidate = m_buffers.upper_bound(vaddr);
+	if (candidate == m_buffers.begin()) {
+		return {};
+	}
+	const auto& [address, id] = *std::prev(candidate);
+	return m_slot_buffers[id].IsInBounds(vaddr, size) ? id : BufferId {};
+}
+
+bool BufferCache::IsGpuCopyableGpuWrite(uint64_t vaddr, uint64_t size) {
+	return HasGpuDirtyBytes(vaddr, size) && !m_texture_cache.IsRegionGpuModified(vaddr, size) &&
+	       FindCoveringBuffer(vaddr, size);
+}
+
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }

@@ -1,16 +1,19 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SRTWALKER_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SRTWALKER_H_
 
+#include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <array>
 #include <span>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
+using SrtGpuWrittenQuery = bool (*)(void* userdata, uint64_t address, uint64_t size);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -26,6 +29,11 @@ struct SrtRuntime {
 	// Optional: reads an aligned, nonzero 64-byte block for read_memory (with userdata) only when
 	// reading each of its dwords with read_memory would give the same values; false otherwise.
 	SrtMemoryReader           read_memory_block          = nullptr;
+	// Optional (Thread_Gpu): whether reading [address, address + size) would wait for bytes the
+	// GPU wrote, which a GPU copy can read instead. A refresh then leaves slots that only the
+	// shader reads (CompiledResourcePlan::gpu_fillable) to ResourceSnapshot::gpu_srt_fills.
+	SrtGpuWrittenQuery gpu_written          = nullptr;
+	void*              gpu_written_userdata = nullptr;
 };
 
 [[nodiscard]] inline void* SpecializationUserdata(const SrtRuntime& runtime) {
@@ -98,14 +106,25 @@ public:
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
 	// An empty span means that all sources are active.
 	std::span<const uint8_t> FindActiveSources();
-	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+	// With fills and the runtime's gpu_written query, GPU-written slots that only the shader reads
+	// are left at zero and listed in fills instead of read.
+	bool RefreshFlatBuffer(std::vector<uint32_t>& flat, std::vector<GpuSrtFill>* fills = nullptr);
 
 private:
 	bool EvaluateWide(uint32_t node, uint64_t& result);
 	bool EvaluateInst(const ResourceNode& node, uint64_t& result);
 	bool EvaluateRawRead(const ResourceNode& node, uint64_t& result);
+	// The dword address a RawAddress or RawBuffer node reads; false where its read would fail.
+	bool RawReadAddress(const ResourceNode& node, uint64_t& address);
+	// The guest addresses of a run's first and last dwords.
+	bool FlatRunRange(const CompiledResourcePlan::FlatRun& run, uint64_t& first, uint64_t& last);
 	// Reads a run's dwords into their flat slots; false leaves them unchanged.
 	bool ReadFlatRun(const CompiledResourcePlan::FlatRun& run, std::vector<uint32_t>& flat);
+	// Lists a GPU-written run or slot in fills instead of reading it; false when it must be read.
+	// written: whether the run holds GPU-written bytes at all.
+	bool DeferFlatRun(const CompiledResourcePlan::FlatRun& run, std::vector<uint32_t>& flat,
+	                  std::vector<GpuSrtFill>& fills, bool& written);
+	bool DeferSlot(uint32_t slot, std::vector<uint32_t>& flat, std::vector<GpuSrtFill>& fills);
 
 	const ResourcePlan&              m_program;
 	const CompiledResourcePlan&      m_compiled;

@@ -126,6 +126,8 @@ const char* KindName(Kind kind) {
 		case Kind::Lookahead: return "lookahead";
 		case Kind::GpuThreadIdle: return "gpu-thread-idle";
 		case Kind::StaleRead: return "stale-read";
+		case Kind::SrtGpuFill: return "srt-gpu-fill";
+		case Kind::SrtGpuFillCpu: return "srt-gpu-fill-cpu";
 		case Kind::Count: break;
 	}
 	return "?";
@@ -418,6 +420,10 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds, bool 
 			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} ({:.1f}/frame)\n", KindName(row.kind),
 			                    ReasonName(row.reason), OpName(row.op), row.count,
 			                    per(static_cast<double>(row.count)));
+		} else if (row.kind == Kind::SrtGpuFill || row.kind == Kind::SrtGpuFillCpu) {
+			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} dwords={} ({:.1f}/frame)\n",
+			                    KindName(row.kind), ReasonName(row.reason), OpName(row.op),
+			                    row.count, row.value, per(static_cast<double>(row.count)));
 		} else if (row.kind == Kind::IndirectArgsCpu || row.kind == Kind::IndirectArgsGpu) {
 			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} mesh={}\n", KindName(row.kind),
 			                    ReasonName(row.reason), OpName(row.op), row.count, row.value);

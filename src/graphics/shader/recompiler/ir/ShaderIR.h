@@ -614,6 +614,10 @@ struct CompiledResourcePlan {
 	std::vector<FlatRun>                 flat_runs;
 	std::vector<FlatRunEntry>            run_entries;
 	std::vector<uint8_t>                 in_run; // Per srt_reads entry; empty without runs.
+	// Per srt_reads entry: an ordinary RawAddress or RawBuffer slot that no host evaluation reads
+	// (no descriptor, indirect image key, condition, uniform fill or slot address uses it), so
+	// only the translated shader consumes its flat SRT dword.
+	std::vector<uint8_t>                 gpu_fillable;
 	std::vector<std::array<uint32_t, 8>> descriptors; // Nodes per descriptor source dword.
 	// Per descriptor source dword: the flat SRT offset when the dword is exactly a slot that the
 	// ordinary walker reads (so its value is already in the refreshed flat buffer), else NoNode.

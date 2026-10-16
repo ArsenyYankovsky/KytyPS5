@@ -59,6 +59,8 @@ enum class Kind : uint8_t {
 	Lookahead,          // A pipeline look-ahead walk, including the shaders it translated, in ns.
 	GpuThreadIdle,      // Thread_Gpu waiting for a submission or command, in ns.
 	StaleRead,          // A guest read answered with previous bytes (relaxed readback).
+	SrtGpuFill,         // GPU-written flat SRT dwords copied on the GPU; the value is dwords.
+	SrtGpuFillCpu,      // Such dwords read on the CPU after all (no buffer held them whole).
 	Count,
 };
 
