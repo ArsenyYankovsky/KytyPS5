@@ -4,6 +4,16 @@ name: Build and Release BryKytyPS5
 # Bryan has chosen to publish is released, and pushes to the private repo cost no build minutes.
 on:
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: Platforms to build
+        type: choice
+        options:
+          - windows
+          - all
+          - linux
+          - macos
+        default: windows
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -32,6 +42,7 @@ jobs:
   windows:
     name: Build KytyPS5 (Windows)
     needs: metadata
+    if: inputs.platforms == 'all' || inputs.platforms == 'windows'
     runs-on: windows-2022
 
     steps:
@@ -139,6 +150,7 @@ jobs:
   macos:
     name: Build KytyPS5 (macOS)
     needs: metadata
+    if: inputs.platforms == 'all' || inputs.platforms == 'macos'
     runs-on: macos-15
 
     steps:
@@ -293,6 +305,7 @@ jobs:
   linux:
     name: Build KytyPS5 (Linux)
     needs: metadata
+    if: inputs.platforms == 'all' || inputs.platforms == 'linux'
     runs-on: ubuntu-24.04
 
     steps:
