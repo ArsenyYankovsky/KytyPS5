@@ -658,15 +658,17 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-// CPUID 0x80000001 ECX bit 6: SSE4a (AMD only; EXTRQ, INSERTQ, MOVNTSS, MOVNTSD).
-static bool HostHasSse4a() {
+// CPUID 0x80000001 ECX bit 6: SSE4a (EXTRQ, INSERTQ, MOVNTSS, MOVNTSD); bit 29: MONITORX
+// (MONITORX, MWAITX). The PS5's Zen 2 and other AVX2-capable AMD CPUs have both; Intel has neither.
+static bool HostHasAmdInstructions() {
 	int regs[4] {};
 	__cpuid(regs, static_cast<int>(0x80000000u));
 	if (static_cast<unsigned>(regs[0]) < 0x80000001u) {
 		return false;
 	}
 	__cpuid(regs, static_cast<int>(0x80000001u));
-	return (regs[2] & (1 << 6)) != 0;
+	constexpr int Required = (1 << 6) | (1 << 29);
+	return (regs[2] & Required) == Required;
 }
 #endif
 
@@ -1832,10 +1834,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
-	// Guest code uses SSE4a (EXTRQ/INSERTQ) heavily. Without it on the host (every Intel CPU) each
-	// one is a trapped, emulated exception whose frame Windows builds below RSP, over a live red zone.
-	const bool         protect_sse4a           = !HostHasSse4a();
-	const bool         use_red_zone_protection = protect_memory_faults || emulate_rsqrt || protect_sse4a;
+	// Guest code uses SSE4a (EXTRQ/INSERTQ) heavily, and MONITORX/MWAITX in wait loops. Without
+	// them on the host (every Intel CPU) each one traps into the exception handler, so they are
+	// rewritten at load time.
+	const bool rewrite_amd_instructions = !HostHasAmdInstructions();
+	const bool use_red_zone_protection =
+	    protect_memory_faults || emulate_rsqrt || rewrite_amd_instructions;
 	constexpr uint64_t RED_ZONE_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (use_red_zone_protection) {
 		EXIT_IF(RED_ZONE_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
@@ -1968,16 +1972,18 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		if (use_red_zone_protection) {
 			const auto result =
 			    PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                           protect_memory_faults, emulate_rsqrt, protect_sse4a);
+			                           protect_memory_faults, emulate_rsqrt, rewrite_amd_instructions);
 			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
-			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 ", host_emulated=%" PRIu64 "\n",
+			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 ", host_emulated=%" PRIu64
+			     ", amd_rewritten=%" PRIu64 "\n",
 			     Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
 			     result.red_zone_function_count, result.memory_instruction_count,
 			     result.patched_memory_instruction_count, result.short_memory_instruction_count,
 			     result.stack_dependent_memory_instruction_count,
 			     result.control_flow_memory_instruction_count,
-			     result.unrelocatable_memory_instruction_count, result.host_emulated_instruction_count);
+			     result.unrelocatable_memory_instruction_count, result.host_emulated_instruction_count,
+			     result.rewritten_amd_instruction_count);
 			reciprocal_sqrt_count = result.reciprocal_sqrt_instruction_count;
 		}
 #else

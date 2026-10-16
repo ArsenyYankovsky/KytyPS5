@@ -24,6 +24,7 @@ struct RedZonePatchResult {
 	uint64_t indirect_red_zone_function_count         = 0;
 	uint64_t reciprocal_sqrt_instruction_count        = 0;
 	uint64_t host_emulated_instruction_count          = 0;
+	uint64_t rewritten_amd_instruction_count          = 0;
 };
 
 void RegisterRedZonePatchModule(void* module_ptr, uint64_t module_size, void* trampoline_area_ptr,
@@ -31,12 +32,13 @@ void RegisterRedZonePatchModule(void* module_ptr, uint64_t module_size, void* tr
 void UnregisterRedZonePatchModule(void* module_ptr);
 
 // Analyze and protect fault sites before replacing reciprocal roots with traps.
-// protect_sse4a keeps the red zone intact around AMD-only instructions (EXTRQ, INSERTQ,
-// MONITORX, MWAITX) that a host without them traps and emulates.
+// rewrite_amd_instructions is for hosts without SSE4a and MONITORX (every Intel CPU): immediate
+// EXTRQ/INSERTQ become SSE2 sequences, MONITORX/MWAITX become NOP/PAUSE, and the remaining
+// register-form EXTRQ/INSERTQ, which still trap and are emulated, keep the red zone intact.
 RedZonePatchResult PatchGuestInstructions(uint64_t segment_addr, uint64_t segment_size,
                                           std::span<const uintptr_t> function_starts,
                                           bool protect_memory, bool emulate_rsqrt,
-                                          bool protect_sse4a = false);
+                                          bool rewrite_amd_instructions = false);
 
 bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
                                  std::vector<uintptr_t>* function_starts);

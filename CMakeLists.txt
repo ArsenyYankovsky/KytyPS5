@@ -783,6 +783,22 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 	endif()
 endif()
 
+# Test the load-time rewrite of SSE4a and MONITORX instructions for hosts without them.
+if(WIN32)
+	add_executable(windows_sse4a_rewrite_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/windowsSse4aRewriteTests.cpp"
+		"${KYTY_SOURCE_DIR}/loader/redZonePatcher.cpp"
+		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+	)
+	target_link_libraries(windows_sse4a_rewrite_tests common fmt::fmt Zydis::Zydis xbyak::xbyak)
+	target_include_directories(windows_sse4a_rewrite_tests PRIVATE ${inc_headers})
+	if(BUILD_TESTING)
+		add_test(NAME windows_sse4a_rewrite COMMAND $<TARGET_FILE:windows_sse4a_rewrite_tests>)
+		set_tests_properties(windows_sse4a_rewrite PROPERTIES TIMEOUT 30)
+		add_dependencies(kyty_tests windows_sse4a_rewrite_tests)
+	endif()
+endif()
+
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
 

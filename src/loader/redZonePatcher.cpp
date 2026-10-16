@@ -136,9 +136,19 @@ struct DecodedFunction {
 	bool                                        requires_conservative_red_zone_tracking {};
 };
 
+// EXTRQ or INSERTQ with immediate fields, the forms compilers emit for SSE4a shuffles.
+struct Sse4aBitField {
+	u8   destination {};
+	u8   source {};
+	u8   length {}; // 1..64, clamped to the bits above index as the exception handler does
+	u8   index {};
+	bool insert {};
+};
+
 struct InstructionRewrite {
-	bool protect_red_zone {};
-	bool protected_indirect_call {};
+	bool                         protect_red_zone {};
+	bool                         protected_indirect_call {};
+	std::optional<Sse4aBitField> sse4a_bit_field;
 };
 
 bool IsStackPointerRegister(ZydisRegister reg) {
@@ -799,32 +809,159 @@ void CollectReciprocalSquareRoots(const DecodedFunction& function,
 	}
 }
 
-// A host without SSE4a/MONITORX traps these instructions and emulates them in the exception
-// handler. Windows builds the exception frame just below RSP, which would overwrite a red zone
-// that is live at the instruction, so such sites run with RSP lowered past the red zone.
-bool IsHostEmulatedAmdInstruction(const ZydisDecodedInstruction& instruction) {
-	switch (instruction.mnemonic) {
-		case ZYDIS_MNEMONIC_EXTRQ:
-		case ZYDIS_MNEMONIC_INSERTQ:
-		case ZYDIS_MNEMONIC_MONITORX:
-		case ZYDIS_MNEMONIC_MWAITX: return true;
-		default: return false;
+std::optional<Sse4aBitField> DecodeSse4aBitField(const DecodedCodeInstruction& decoded) {
+	const bool insert = decoded.instruction.mnemonic == ZYDIS_MNEMONIC_INSERTQ;
+	if (!insert && decoded.instruction.mnemonic != ZYDIS_MNEMONIC_EXTRQ) {
+		return std::nullopt;
 	}
+	// EXTRQ xmm, imm8, imm8 reads and writes one register; INSERTQ xmm, xmm, imm8, imm8 adds a
+	// source. The register forms take the field from an XMM register and have no immediates.
+	const u8 register_count = insert ? 2 : 1;
+	if (decoded.instruction.operand_count_visible != register_count + 2) {
+		return std::nullopt;
+	}
+	std::array<u8, 2> registers {};
+	for (u8 index = 0; index < register_count; ++index) {
+		const auto& operand = decoded.operands[index];
+		if (operand.type != ZYDIS_OPERAND_TYPE_REGISTER ||
+		    operand.reg.value < ZYDIS_REGISTER_XMM0 || operand.reg.value > ZYDIS_REGISTER_XMM15) {
+			return std::nullopt;
+		}
+		registers[index] = static_cast<u8>(operand.reg.value - ZYDIS_REGISTER_XMM0);
+	}
+	const auto& length_operand = decoded.operands[register_count];
+	const auto& index_operand  = decoded.operands[register_count + 1];
+	if (length_operand.type != ZYDIS_OPERAND_TYPE_IMMEDIATE ||
+	    index_operand.type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+		return std::nullopt;
+	}
+
+	const auto index  = static_cast<u32>(index_operand.imm.value.u & 0x3fu);
+	auto       length = static_cast<u32>(length_operand.imm.value.u & 0x3fu);
+	if (length == 0) {
+		length = 64;
+	}
+	return Sse4aBitField {
+	    .destination = registers[0],
+	    .source      = registers[register_count - 1],
+	    .length      = static_cast<u8>(std::min(length, 64 - index)),
+	    .index       = static_cast<u8>(index),
+	    .insert      = insert,
+	};
 }
 
+// The replacement is legacy SSE like EXTRQ/INSERTQ themselves, so bits 255:128 of the YMM
+// registers survive, and none of it touches RFLAGS. Results match the exception handler's.
+void EmitSse4aBitField(const Sse4aBitField& field, Xbyak::CodeGenerator& generator) {
+	const Xbyak::Xmm destination(field.destination);
+	const int        bits_above = 64 - field.length - field.index;
+	if (!field.insert) {
+		// Shift the field to the top of the quadword, then down to bit 0. MOVQ zeroes the upper
+		// quadword.
+		if (bits_above != 0) {
+			generator.psllq(destination, bits_above);
+		}
+		if (field.length != 64) {
+			generator.psrlq(destination, 64 - field.length);
+		}
+		generator.movq(destination, destination);
+		return;
+	}
+
+	const Xbyak::Xmm source(field.source);
+	if (field.length == 64) {
+		generator.movsd(destination, source);
+		return;
+	}
+
+	// Build the field mask in a scratch register, with MOVQ zeroing its upper quadword, and use it
+	// to keep everything in the destination but the field. The destination then lines up the
+	// source field, which still holds when source and destination are the same register, and
+	// merges. The scratch register is spilled below the red zone, which may be live here.
+	u8 scratch_index = 0;
+	while (scratch_index == field.destination || scratch_index == field.source) {
+		++scratch_index;
+	}
+	const Xbyak::Xmm scratch(scratch_index);
+	const auto       line_up_field = [&](const Xbyak::Xmm& xmm) {
+		generator.psllq(xmm, 64 - field.length);
+		if (bits_above != 0) {
+			generator.psrlq(xmm, bits_above);
+		}
+	};
+
+	constexpr size_t ScratchSpillOffset = GuestRedZoneSize + 16;
+	generator.lea(rsp, ptr[rsp - ScratchSpillOffset]);
+	generator.movdqu(ptr[rsp], scratch);
+	generator.pcmpeqd(scratch, scratch);
+	line_up_field(scratch);
+	generator.movq(scratch, scratch);
+	generator.pandn(scratch, destination);
+	generator.movq(destination, source);
+	line_up_field(destination);
+	generator.por(destination, scratch);
+	generator.movdqu(scratch, ptr[rsp]);
+	generator.lea(rsp, ptr[rsp + ScratchSpillOffset]);
+}
+
+// On a host without SSE4a, EXTRQ and INSERTQ trap into the exception handler. The immediate forms
+// are rewritten instead. The register forms are still emulated there, and Windows builds the
+// exception frame just below RSP, over a red zone that may be live at the instruction, so those
+// sites run with RSP lowered past the red zone.
 void CollectHostEmulatedAmdInstructions(const DecodedFunction& function,
                                         std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                                         RedZonePatchResult& result) {
-	if (!function.uses_red_zone) {
-		return;
-	}
 	for (const auto& [address, decoded]: function.instructions) {
-		if (!IsHostEmulatedAmdInstruction(decoded.instruction) || !decoded.red_zone_live.any() ||
-		    rewrite_sites.contains(address)) {
+		if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_EXTRQ &&
+		    decoded.instruction.mnemonic != ZYDIS_MNEMONIC_INSERTQ) {
+			continue;
+		}
+		if (auto field = DecodeSse4aBitField(decoded)) {
+			rewrite_sites[address].sse4a_bit_field = field;
+			continue;
+		}
+		if (!decoded.red_zone_live.any() || rewrite_sites.contains(address)) {
 			continue;
 		}
 		rewrite_sites[address].protect_red_zone = true;
 		++result.host_emulated_instruction_count;
+	}
+}
+
+// MONITORX/MWAITX trap on a host without them. They only tell the CPU that the thread is waiting,
+// and guest code checks its condition again after MWAITX, so they are patched in place to NOP and
+// PAUSE. That keeps the thread on its core, as on an AMD host, instead of entering the exception
+// handler on every pass of a wait loop.
+void RewriteMonitorxWaits(PatchModule* module, DecodedFunction& function, uintptr_t function_end,
+                          RedZonePatchResult& result) {
+	std::vector<uintptr_t> sites;
+	for (const auto& [address, decoded]: function.instructions) {
+		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MONITORX ||
+		    decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MWAITX) {
+			sites.push_back(address);
+		}
+	}
+
+	auto& patch_gen = module->patch_gen;
+	for (const uintptr_t address: sites) {
+		const auto   original = function.instructions.extract(address);
+		const size_t length   = original.mapped().instruction.length;
+		patch_gen.reset();
+		patch_gen.setSize(address - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+		if (original.mapped().instruction.mnemonic == ZYDIS_MNEMONIC_MWAITX) {
+			patch_gen.pause();
+			patch_gen.nop(length - 2);
+		} else {
+			patch_gen.nop(length);
+		}
+		// Analysis and relocation work from the decoded replacement.
+		for (uintptr_t next = address; next < address + length;) {
+			auto replacement = DecodeCodeInstruction(next, function_end);
+			ASSERT(replacement.instruction.length != 0);
+			next += replacement.instruction.length;
+			function.instructions.emplace(replacement.address, std::move(replacement));
+		}
+		++result.rewritten_amd_instruction_count;
 	}
 }
 
@@ -868,6 +1005,10 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 		try {
 			for (const auto* decoded: span.instructions) {
 				const auto rewrite = rewrite_sites.find(decoded->address);
+				if (rewrite != rewrite_sites.end() && rewrite->second.sse4a_bit_field) {
+					EmitSse4aBitField(*rewrite->second.sse4a_bit_field, module->trampoline_gen);
+					continue;
+				}
 				const bool protected_indirect_call =
 				    rewrite != rewrite_sites.end() && rewrite->second.protected_indirect_call;
 				const bool protect_red_zone = rewrite != rewrite_sites.end() &&
@@ -906,6 +1047,9 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 			const auto rewrite = rewrite_sites.find(decoded->address);
 			if (rewrite == rewrite_sites.end()) {
 				continue;
+			}
+			if (rewrite->second.sse4a_bit_field) {
+				++result.rewritten_amd_instruction_count;
 			}
 			if (rewrite->second.protect_red_zone && decoded->accesses_memory) {
 				++result.patched_memory_instruction_count;
@@ -1272,7 +1416,7 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
                                           std::span<const uintptr_t> function_starts,
                                           bool protect_memory, bool emulate_rsqrt,
-                                          bool protect_sse4a) {
+                                          bool rewrite_amd_instructions) {
 	RedZonePatchResult result {};
 	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
 	if (module == nullptr || function_starts.empty()) {
@@ -1304,6 +1448,9 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 
 		++result.function_count;
 		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
+		if (rewrite_amd_instructions) {
+			RewriteMonitorxWaits(module, function, function_end, result);
+		}
 		AnalyzeRedZoneLiveness(function);
 		result.instruction_count += function.instructions.size();
 
@@ -1319,7 +1466,7 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 		if (emulate_rsqrt) {
 			CollectReciprocalSquareRoots(function, rewrite_sites, reciprocal_sqrt_sites);
 		}
-		if (protect_sse4a) {
+		if (rewrite_amd_instructions) {
 			CollectHostEmulatedAmdInstructions(function, rewrite_sites, result);
 		}
 		if (!rewrite_sites.empty()) {
