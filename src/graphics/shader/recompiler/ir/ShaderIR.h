@@ -618,6 +618,17 @@ struct CompiledResourcePlan {
 	// (no descriptor, indirect image key, condition, uniform fill or slot address uses it), so
 	// only the translated shader consumes its flat SRT dword.
 	std::vector<uint8_t>                 gpu_fillable;
+	// Per srt_reads entry: the host evaluations that read the slot (HostUse bits), for diagnostics.
+	enum HostUse : uint8_t {
+		HostDescriptor  = 1u,
+		HostIndirectKey = 2u,
+		HostCondition   = 4u,
+		HostFill        = 8u,
+		HostSlotAddress = 16u,
+		HostCleanSlot   = 32u,
+		HostNotRaw      = 64u,
+	};
+	std::vector<uint8_t>                 host_use;
 	std::vector<std::array<uint32_t, 8>> descriptors; // Nodes per descriptor source dword.
 	// Per descriptor source dword: the flat SRT offset when the dword is exactly a slot that the
 	// ordinary walker reads (so its value is already in the refreshed flat buffer), else NoNode.

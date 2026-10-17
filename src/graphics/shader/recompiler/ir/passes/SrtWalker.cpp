@@ -1443,9 +1443,10 @@ void BuildFlatRuns(const ResourcePlan& program, CompiledResourcePlan& compiled) 
 // the uniform fill or the address of any slot's read reads it. The other ordinary slots feed only
 // the translated shader, through the flat SRT buffer.
 void AnalyzeGpuFillableSlots(const ResourcePlan& program, CompiledResourcePlan& compiled) {
+	using HostUse               = CompiledResourcePlan::HostUse;
 	const auto            count = compiled.slots.size();
 	std::vector<uint8_t>  host(count, 0u);
-	std::vector<uint8_t>  visited(compiled.nodes.size(), 0u);
+	std::vector<uint8_t>  visited;
 	std::vector<uint32_t> pending;
 	// A host value may also use a slot's read node itself rather than its ReadConst.
 	std::vector<uint32_t> slot_of(compiled.nodes.size(), ResourceNode::NoNode);
@@ -1460,56 +1461,77 @@ void AnalyzeGpuFillableSlots(const ResourcePlan& program, CompiledResourcePlan& 
 			pending.push_back(index);
 		}
 	};
-	for (const auto& dwords: compiled.descriptors) {
-		for (const auto index: dwords) {
-			push(index);
-		}
-	}
-	for (auto* roots: {&compiled.key_counts, &compiled.selector_masks, &compiled.conditions}) {
-		for (const auto index: *roots) {
-			push(index);
-		}
-	}
-	for (const auto index: compiled.fill) {
-		push(index);
-	}
-	for (const auto slot: compiled.slots) {
-		if (slot < compiled.nodes.size()) {
-			for (const auto arg: compiled.nodes[slot].args) {
+	// Marks the slots each kind of host evaluation reads, one kind at a time.
+	const auto mark = [&](uint8_t use, const auto& add_roots) {
+		visited.assign(compiled.nodes.size(), 0u);
+		add_roots();
+		while (!pending.empty()) {
+			const auto  index = pending.back();
+			const auto& node  = compiled.nodes[index];
+			pending.pop_back();
+			if (slot_of[index] != ResourceNode::NoNode) {
+				host[slot_of[index]] |= use;
+			}
+			if (node.op == NodeOp::ReadConst && node.aux < count) {
+				host[node.aux] |= use;
+				const auto flat_offset = program.srt_reads[node.aux].flat_offset;
+				if (flat_offset < count) {
+					host[flat_offset] |= use;
+				}
+			}
+			for (const auto arg: node.args) {
 				push(arg);
 			}
 		}
-	}
-	while (!pending.empty()) {
-		const auto  index = pending.back();
-		const auto& node  = compiled.nodes[index];
-		pending.pop_back();
-		if (slot_of[index] != ResourceNode::NoNode) {
-			host[slot_of[index]] = 1u;
-		}
-		if (node.op == NodeOp::ReadConst && node.aux < count) {
-			host[node.aux]         = 1u;
-			const auto flat_offset = program.srt_reads[node.aux].flat_offset;
-			if (flat_offset < count) {
-				host[flat_offset] = 1u;
+	};
+	mark(HostUse::HostDescriptor, [&] {
+		for (const auto& dwords: compiled.descriptors) {
+			for (const auto index: dwords) {
+				push(index);
 			}
 		}
-		for (const auto arg: node.args) {
-			push(arg);
+	});
+	mark(HostUse::HostIndirectKey, [&] {
+		for (auto* roots: {&compiled.key_counts, &compiled.selector_masks}) {
+			for (const auto index: *roots) {
+				push(index);
+			}
 		}
-	}
+	});
+	mark(HostUse::HostCondition, [&] {
+		for (const auto index: compiled.conditions) {
+			push(index);
+		}
+	});
+	mark(HostUse::HostFill, [&] {
+		for (const auto index: compiled.fill) {
+			push(index);
+		}
+	});
+	mark(HostUse::HostSlotAddress, [&] {
+		for (const auto slot: compiled.slots) {
+			if (slot < compiled.nodes.size()) {
+				for (const auto arg: compiled.nodes[slot].args) {
+					push(arg);
+				}
+			}
+		}
+	});
 	compiled.gpu_fillable.assign(count, 0u);
+	compiled.host_use.assign(count, 0u);
 	for (uint32_t slot = 0; slot < count; slot++) {
 		const auto flat_offset = program.srt_reads[slot].flat_offset;
 		const auto index       = compiled.slots[slot];
-		if (host[slot] != 0u || flat_offset >= count || host[flat_offset] != 0u ||
-		    index >= compiled.nodes.size() ||
-		    (flat_offset < compiled.clean_slots.size() &&
-		     compiled.clean_slots[flat_offset] != 0u)) {
-			continue;
+		auto&      use         = compiled.host_use[slot];
+		use = static_cast<uint8_t>(host[slot] | (flat_offset < count ? host[flat_offset] : 0u));
+		if (flat_offset < compiled.clean_slots.size() && compiled.clean_slots[flat_offset] != 0u) {
+			use |= HostUse::HostCleanSlot;
 		}
-		const auto op               = compiled.nodes[index].op;
-		compiled.gpu_fillable[slot] = op == NodeOp::RawAddress || op == NodeOp::RawBuffer ? 1u : 0u;
+		const auto op = index < compiled.nodes.size() ? compiled.nodes[index].op : NodeOp::Fail;
+		if (op != NodeOp::RawAddress && op != NodeOp::RawBuffer) {
+			use |= HostUse::HostNotRaw;
+		}
+		compiled.gpu_fillable[slot] = use == 0u && flat_offset < count ? 1u : 0u;
 	}
 }
 
@@ -2232,12 +2254,20 @@ bool SrtEvaluator::DeferFlatRun(const CompiledResourcePlan::FlatRun& run,
 
 bool SrtEvaluator::DeferSlot(uint32_t slot, std::vector<uint32_t>& flat,
                              std::vector<GpuSrtFill>& fills) {
-	const auto offset  = m_program.srt_reads[slot].flat_offset;
-	uint64_t   address = 0;
+	const auto  offset   = m_program.srt_reads[slot].flat_offset;
+	const bool  fillable = m_compiled.gpu_fillable[slot] != 0u;
+	const auto& node     = m_nodes[m_compiled.slots[slot]];
+	uint64_t    address  = 0;
 	// A read that would fail is left to evaluation, which fails the same way.
-	if (m_compiled.gpu_fillable[slot] == 0u || offset >= flat.size() ||
-	    !RawReadAddress(m_nodes[m_compiled.slots[slot]], address) ||
+	if ((!fillable && m_runtime.note_host_read == nullptr) || offset >= flat.size() ||
+	    (node.op != NodeOp::RawAddress && node.op != NodeOp::RawBuffer) ||
+	    !RawReadAddress(node, address) ||
 	    !m_runtime.gpu_written(m_runtime.gpu_written_userdata, address, sizeof(uint32_t))) {
+		return false;
+	}
+	if (!fillable) {
+		m_runtime.note_host_read(m_runtime.gpu_written_userdata, m_program.shader_hash, slot,
+		                         address, m_compiled.host_use[slot]);
 		return false;
 	}
 	flat[offset] = 0;

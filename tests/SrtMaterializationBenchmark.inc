@@ -1491,5 +1491,142 @@ void PrintPixelInputs(const char *journal_path) {
   std::printf("pixel permutations: %zu, with a default-value input %zu\n", pixel,
               with_default);
 }
+
+// --gpu-descriptor-report <journal copy> <log>: the "srt-host-gpu-read" lines
+// of a
+// --drain-stats log name GPU-written flat SRT slots that draws still read on
+// the host, each read draining the GPU, with how often. This finds each slot's
+// shader in the journal and prints what the slot's descriptor binds, the most
+// frequent first. Buffers a shader only loads from without a format could take
+// their descriptor from the flat SRT on the GPU (as IndirectBuffer does);
+// textures, samplers, formatted and written buffers need it on the host.
+void RunGpuDescriptorReport(const char *journal_path, const char *log_path) {
+  constexpr const char *name = "GpuDescriptorReport";
+  using namespace ShaderRecompiler;
+  struct HostRead {
+    uint64_t address = 0;
+    uint64_t count = 0;
+  };
+  std::map<std::pair<uint64_t, uint32_t>, HostRead> reads;
+  std::ifstream log(log_path);
+  for (std::string line; std::getline(log, line);) {
+    const auto at = line.find("srt-host-gpu-read: ");
+    unsigned long long shader = 0, address = 0, count = 1;
+    unsigned slot = 0;
+    if (at != std::string::npos &&
+        std::sscanf(
+            line.c_str() + at,
+            "srt-host-gpu-read: shader=0x%llx slot=%u addr=0x%llx n=%llu",
+            &shader, &slot, &address, &count) >= 3) {
+      auto &read = reads[{shader, slot}];
+      read.address = address;
+      read.count += count;
+    }
+  }
+  Require(name, "log", !reads.empty(),
+          std::string("no srt-host-gpu-read lines in ") + log_path);
+  auto records = ReadShaderJournalCopy(journal_path);
+  Require(name, "journal", !records.empty(),
+          std::string("no records read from ") + journal_path);
+  const auto plans = TranslateJournalPlans(records);
+  std::vector<std::pair<std::pair<uint64_t, uint32_t>, HostRead>> sorted(
+      reads.begin(), reads.end());
+  std::ranges::sort(sorted, [](const auto &a, const auto &b) {
+    return a.second.count > b.second.count;
+  });
+  std::printf("%zu GPU-written slots read on the host, %zu distinct plans\n",
+              sorted.size(), plans.size());
+
+  // Reads (weighted by count) and distinct slots per kind of binding.
+  std::map<std::string, std::pair<uint64_t, uint32_t>> totals;
+  const auto add = [&](const std::string &kind, uint64_t count) {
+    totals[kind].first += count;
+    totals[kind].second++;
+  };
+  for (const auto &[key, read] : sorted) {
+    const auto [shader, slot] = key;
+    bool found = false;
+    for (const auto &entry : plans) {
+      const auto &plan = entry.plan;
+      if (entry.hash != shader || slot >= plan.srt_reads.size() || found) {
+        continue;
+      }
+      found = true;
+      const auto &compiled = IR::CompileResourcePlan(plan);
+      const auto offset = plan.srt_reads[slot].flat_offset;
+      std::string uses;
+      std::set<std::string> kinds;
+      for (uint32_t source = 0; source < compiled.descriptor_slots.size();
+           source++) {
+        const auto &dwords = compiled.descriptor_slots[source];
+        const auto dword = std::ranges::find(dwords, offset) - dwords.begin();
+        if (dword == static_cast<ptrdiff_t>(dwords.size())) {
+          continue;
+        }
+        std::string kind;
+        for (size_t i = 0; i < plan.info.buffers.size(); i++) {
+          const auto &buffer = plan.info.buffers[i];
+          if (buffer.source != source) {
+            continue;
+          }
+          kind = buffer.written     ? "buffer-written"
+                 : buffer.formatted ? "buffer-formatted"
+                 : buffer.scalar    ? "buffer-scalar-load"
+                                    : "buffer-raw-load";
+          uses += fmt::format(" {}#{}.dw{}", kind, i, dword);
+          kinds.insert(kind);
+        }
+        for (size_t i = 0; i < plan.info.images.size(); i++) {
+          const auto &image = plan.info.images[i];
+          if (image.source != source) {
+            continue;
+          }
+          kind = image.written ? "image-storage" : "image-sampled";
+          uses += fmt::format(" {}#{}.dw{}", kind, i, dword);
+          kinds.insert(kind);
+        }
+        for (size_t i = 0; i < plan.info.samplers.size(); i++) {
+          if (plan.info.samplers[i].source != source) {
+            continue;
+          }
+          kind = "sampler";
+          uses += fmt::format(" sampler#{}.dw{}", i, dword);
+          kinds.insert(kind);
+        }
+        if (kind.empty()) {
+          kind = plan.descriptor_sources[source].indirect_image
+                     ? "indirect-image-table"
+                     : "unbound-source";
+          uses += fmt::format(" {}#{}.dw{}", kind, source, dword);
+          kinds.insert(kind);
+        }
+      }
+      if (uses.empty()) {
+        uses = " derived (no descriptor dword is the slot itself)";
+        kinds.insert("derived");
+      }
+      for (const auto &kind : kinds) {
+        add(kind, read.count);
+      }
+      std::printf("n=%-6llu stage=%u %016llx slot=%u addr=0x%llx:%s\n",
+                  static_cast<unsigned long long>(read.count),
+                  static_cast<unsigned>(entry.stage),
+                  static_cast<unsigned long long>(shader), slot,
+                  static_cast<unsigned long long>(read.address), uses.c_str());
+    }
+    if (!found) {
+      std::printf("n=%-6llu %016llx slot=%u: not in the journal\n",
+                  static_cast<unsigned long long>(read.count),
+                  static_cast<unsigned long long>(shader), slot);
+      add("not-in-journal", read.count);
+    }
+  }
+  std::printf("totals (reads, slots):");
+  for (const auto &[kind, total] : totals) {
+    std::printf(" %s=%llu/%u", kind.c_str(),
+                static_cast<unsigned long long>(total.first), total.second);
+  }
+  std::printf("\n");
+}
 } // namespace
 } // namespace Libs::Graphics

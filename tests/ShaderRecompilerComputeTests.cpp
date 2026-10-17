@@ -36557,6 +36557,10 @@ int main(int argc, char **argv) {
                     argc == 4 ? static_cast<uint32_t>(std::atoi(argv[3])) : 0u);
     return 0;
   }
+  if (argc == 4 && std::strcmp(argv[1], "--gpu-descriptor-report") == 0) {
+    RunGpuDescriptorReport(argv[2], argv[3]);
+    return 0;
+  }
   if (argc >= 4 && std::strcmp(argv[1], "--journal-disasm") == 0) {
     RunJournalDisasm(argv[2], std::span(argv + 3, argc - 3));
     return 0;

@@ -14,6 +14,8 @@ class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
 using SrtGpuWrittenQuery = bool (*)(void* userdata, uint64_t address, uint64_t size);
+using SrtHostReadNote    = void (*)(void* userdata, uint64_t shader_hash, uint32_t slot,
+                                    uint64_t address, uint32_t host_use);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -34,6 +36,9 @@ struct SrtRuntime {
 	// shader reads (CompiledResourcePlan::gpu_fillable) to ResourceSnapshot::gpu_srt_fills.
 	SrtGpuWrittenQuery gpu_written          = nullptr;
 	void*              gpu_written_userdata = nullptr;
+	// Optional diagnostics, with gpu_written: a GPU-written slot the refresh still reads on the
+	// host, with its CompiledResourcePlan::host_use bits.
+	SrtHostReadNote note_host_read = nullptr;
 };
 
 [[nodiscard]] inline void* SpecializationUserdata(const SrtRuntime& runtime) {

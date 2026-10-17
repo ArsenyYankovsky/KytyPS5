@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -40,11 +41,14 @@
 #include <fmt/format.h>
 #include <future>
 #include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -145,6 +149,61 @@ bool ReadShaderGuestMemoryOnGpuThread(void*, uint64_t address, std::span<uint32_
 // drain so the CPU can read them. KYTY_SRT_GPU_FILL=0 reads them on the CPU as before.
 bool ShaderGuestMemoryGpuWritten(void*, uint64_t address, uint64_t size) {
 	return Libs::LibKernel::Memory::IsGpuCopyableGpuWriteOnGpuThread(address, size);
+}
+
+// With drain stats: shader slots that are GPU-written but still read on the CPU (each such read
+// waits for the GPU), with what on the host needs them. Every 10 seconds the most frequent ones
+// are logged with their count; tests/SrtMaterializationBenchmark.inc's --gpu-descriptor-report
+// reads these lines. Thread_Gpu and the draw speculator both refresh shader resources.
+void NoteShaderHostRead(void*, uint64_t shader_hash, uint32_t slot, uint64_t address,
+                        uint32_t host_use) {
+	if (!DrainStats::Enabled()) {
+		return;
+	}
+	struct Read {
+		uint64_t address  = 0;
+		uint32_t host_use = 0;
+		uint64_t count    = 0;
+	};
+	static std::mutex                                    mutex;
+	static std::map<std::pair<uint64_t, uint32_t>, Read> window;
+	static auto                                          start = std::chrono::steady_clock::now();
+
+	std::scoped_lock lock(mutex);
+	auto&            read = window[{shader_hash, slot}];
+	read                  = {.address = address, .host_use = host_use, .count = read.count + 1};
+	const auto now        = std::chrono::steady_clock::now();
+	if (now - start < std::chrono::seconds(10)) {
+		return;
+	}
+	start = now;
+	std::vector<std::pair<std::pair<uint64_t, uint32_t>, Read>> sorted(window.begin(),
+	                                                                   window.end());
+	window.clear();
+	std::ranges::sort(sorted,
+	                  [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+	using HostUse = ShaderRecompiler::IR::CompiledResourcePlan::HostUse;
+	std::string text =
+	    fmt::format("srt-host-gpu-reads: {} slots in 10 s, the most frequent:\n", sorted.size());
+	for (size_t i = 0; i < sorted.size() && i < 64; i++) {
+		const auto& [key, entry] = sorted[i];
+		std::string uses;
+		for (const auto& [bit, name]: {std::pair {HostUse::HostDescriptor, "descriptor"},
+		                               {HostUse::HostIndirectKey, "indirect-key"},
+		                               {HostUse::HostCondition, "condition"},
+		                               {HostUse::HostFill, "fill"},
+		                               {HostUse::HostSlotAddress, "slot-address"},
+		                               {HostUse::HostCleanSlot, "clean"},
+		                               {HostUse::HostNotRaw, "not-raw"}}) {
+			if ((entry.host_use & bit) != 0u) {
+				uses += uses.empty() ? "" : "+";
+				uses += name;
+			}
+		}
+		text += fmt::format("srt-host-gpu-read: shader=0x{:016x} slot={} addr=0x{:x} n={} use={}\n",
+		                    key.first, key.second, entry.address, entry.count, uses);
+	}
+	Log::WriteToConsoleAndLog(text);
 }
 
 ShaderRecompiler::IR::SrtGpuWrittenQuery SrtGpuFillQuery() {
@@ -670,6 +729,7 @@ struct PipelineCache::ProgramCache {
 		    .specialization_block_reads = true,
 		    .read_memory_block          = ReadShaderGuestBlockOnGpuThread,
 		    .gpu_written                = SrtGpuFillQuery(),
+		    .note_host_read             = DrainStats::Enabled() ? NoteShaderHostRead : nullptr,
 		};
 		// Refreshes a known source and returns its permutation for the refreshed specialization,
 		// if it has one yet.

@@ -941,8 +941,22 @@ BufferId BufferCache::FindCoveringBuffer(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::IsGpuCopyableGpuWrite(uint64_t vaddr, uint64_t size) {
-	return HasGpuDirtyBytes(vaddr, size) && !m_texture_cache.IsRegionGpuModified(vaddr, size) &&
-	       FindCoveringBuffer(vaddr, size);
+	if (!HasGpuDirtyBytes(vaddr, size)) {
+		return false;
+	}
+	const bool image    = m_texture_cache.IsRegionGpuModified(vaddr, size);
+	const bool copyable = !image && FindCoveringBuffer(vaddr, size);
+	if (!copyable && DrainStats::Enabled()) {
+		// The first refusals: each one leaves a GPU-written shader slot to a CPU read and its wait.
+		static uint32_t printed = 0;
+		if (printed++ < 16) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "srt-gpu-fill refused: addr=0x{:x} size={} reason={}\n", vaddr, size,
+			    image ? "image"
+			          : (IsRegionRegistered(vaddr, size) ? "split-buffers" : "no-buffer")));
+		}
+	}
+	return copyable;
 }
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
