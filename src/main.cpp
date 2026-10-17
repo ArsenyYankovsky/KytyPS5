@@ -1,6 +1,5 @@
 #include "common/archive.h"
 #include "common/common.h"
-#include "common/cpuPlacement.h"
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
@@ -523,7 +522,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 static int Main(int argc, char* argv[]) {
 	VirtualMemory::Init();
 	InitializeThreads();
-	CpuPlacement::Initialize();
 
 	RunOptions options;
 	bool       show_help = false;

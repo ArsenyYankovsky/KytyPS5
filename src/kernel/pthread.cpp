@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/cpuPlacement.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
@@ -1010,7 +1009,6 @@ void PthreadInitSelfForMainThread() {
 	UpdateCurrentThreadStackAttr(&g_pthread_self->attr);
 	g_pthread_self->p               = pthread_self();
 	g_pthread_self->name            = "MainThread";
-	Common::CpuPlacement::PlaceCurrentThread(Common::CpuPlacement::Role::GuestMain);
 	g_pthread_self->guest.thread_id = ++g_pthread_thread_id;
 	g_pthread_self->unique_id       = Common::Thread::GetThreadIdUnique();
 	g_pthread_self->free            = false;

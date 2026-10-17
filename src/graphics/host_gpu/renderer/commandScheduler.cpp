@@ -1,7 +1,6 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
-#include "common/cpuPlacement.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -689,7 +688,6 @@ void CommandScheduler::EnableAsyncSubmit() {
 
 void CommandScheduler::SubmitThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuQueueSubmit");
-	Common::CpuPlacement::PlaceCurrentThread(Common::CpuPlacement::Role::GpuSubmit);
 	if (m_stream != nullptr) {
 		m_stream->Consume(stop);
 		return;
