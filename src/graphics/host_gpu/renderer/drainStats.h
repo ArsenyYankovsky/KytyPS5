@@ -61,6 +61,8 @@ enum class Kind : uint8_t {
 	StaleRead,          // A guest read answered with previous bytes (relaxed readback).
 	SrtGpuFill,         // GPU-written flat SRT dwords copied on the GPU; the value is dwords.
 	SrtGpuFillCpu,      // Such dwords read on the CPU after all (no buffer held them whole).
+	SrtPredicted,       // A GPU-dirty shader-table read served unchanged dwords without waiting.
+	SrtPredictMiss,     // A download changed a dword such a read was served: it waits again.
 	Count,
 };
 

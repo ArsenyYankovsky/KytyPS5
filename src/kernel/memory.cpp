@@ -949,10 +949,16 @@ void ReadGuestOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
 	// The lock-free page hint keeps the common case a plain copy: a stale "clean" faults and
 	// reads back as before, and a stale "dirty" takes the checked backing read.
 	if (size != 0 && g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread()) {
-		const auto& buffers = GetGpuResources().GetBufferCache();
+		auto& buffers = GetGpuResources().GetBufferCache();
 		if ((buffers.IsPageGpuDirtyHint(vaddr) || buffers.IsPageGpuDirtyHint(vaddr + size - 1)) &&
-		    IsGpuAddressRange(vaddr, size) && TryReadGpuCleanBacking(vaddr, data, size)) {
-			return;
+		    IsGpuAddressRange(vaddr, size)) {
+			// GPU-written dwords that the GPU's recent downloads never changed need no wait.
+			if (TryReadGpuCleanBacking(vaddr, data, size) ||
+			    buffers.TryReadUnchangedGpuWrite(vaddr, data, size)) {
+				return;
+			}
+			// The read below waits; its download tells whether the GPU changed these dwords.
+			buffers.WatchGpuWrite(vaddr, size);
 		}
 	}
 	if (size == sizeof(uint32_t)) {

@@ -230,6 +230,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                                    buffer_address, copies = std::move(copies)] {
 		download->Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
+			CheckWatchedPublication(buffer_address + copy.srcOffset,
+			                        mapped + (copy.dstOffset - offset), copy.size);
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
@@ -957,6 +959,98 @@ bool BufferCache::IsGpuCopyableGpuWrite(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	return copyable;
+}
+
+// A compute pass that binds a shader table as writable leaves all of it GPU-dirty, and Thread_Gpu
+// waits for the GPU at each draw that reads a descriptor from it. In Demon's Souls those
+// descriptors never change (about 25 ms of waits a frame), while other dwords of the same
+// tables do. Downloads of such reads show which dwords the GPU never changes: after
+// UnchangedToPredict downloads in a row publish a dword's backing bytes again, Thread_Gpu reads
+// the backing without waiting. Its download still runs and keeps checking; a dword the GPU
+// changed after all (the draws of one frame used its previous bytes) waits from then on.
+// KYTY_SRT_PREDICT=0 always waits.
+namespace {
+
+constexpr uint64_t WatchUnit          = sizeof(uint32_t);
+constexpr uint8_t  UnchangedToPredict = 8;
+constexpr size_t   MaxWatched         = 65536;
+
+bool PredictionEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_SRT_PREDICT");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	return enabled;
+}
+
+} // namespace
+
+bool BufferCache::TryReadUnchangedGpuWrite(uint64_t vaddr, void* data, uint64_t size) {
+	if (size == 0 || !PredictionEnabled() || !m_any_watched.load(std::memory_order_relaxed) ||
+	    m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	{
+		std::scoped_lock lock(m_watched_mutex);
+		for (auto dword = Common::AlignDown(vaddr, WatchUnit); dword < vaddr + size;
+		     dword += WatchUnit) {
+			const auto found = m_watched.find(dword);
+			if (found == m_watched.end() || found->second.banned ||
+			    found->second.unchanged < UnchangedToPredict) {
+				return false;
+			}
+		}
+	}
+	// The download that checks the prediction: recorded, not waited for.
+	RecordReadback(vaddr, size, false);
+	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, data, size)) {
+		return false;
+	}
+	DrainStats::Record(DrainStats::Kind::SrtPredicted, size);
+	return true;
+}
+
+void BufferCache::WatchGpuWrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !PredictionEnabled()) {
+		return;
+	}
+	std::scoped_lock lock(m_watched_mutex);
+	for (auto dword = Common::AlignDown(vaddr, WatchUnit);
+	     dword < vaddr + size && m_watched.size() < MaxWatched; dword += WatchUnit) {
+		m_watched.try_emplace(dword);
+	}
+	m_any_watched.store(true, std::memory_order_relaxed);
+}
+
+void BufferCache::CheckWatchedPublication(uint64_t address, const uint8_t* bytes, uint64_t size) {
+	if (!m_any_watched.load(std::memory_order_relaxed)) {
+		return;
+	}
+	const auto       end = address + size;
+	std::scoped_lock lock(m_watched_mutex);
+	for (auto entry = m_watched.lower_bound(address);
+	     entry != m_watched.end() && entry->first + WatchUnit <= end; ++entry) {
+		auto&    watched = entry->second;
+		uint32_t backing = 0;
+		uint32_t gpu     = 0;
+		std::memcpy(&gpu, bytes + (entry->first - address), sizeof(gpu));
+		if (Libs::LibKernel::Memory::TryReadBacking(entry->first, &backing, sizeof(backing)) &&
+		    backing == gpu) {
+			watched.unchanged =
+			    static_cast<uint8_t>(std::min<uint32_t>(watched.unchanged + 1u, 255u));
+			continue;
+		}
+		if (watched.unchanged >= UnchangedToPredict && !watched.banned) {
+			watched.banned = true;
+			DrainStats::Record(DrainStats::Kind::SrtPredictMiss, 1);
+			if (DrainStats::Enabled()) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "srt-predict miss: dword=0x{:x} 0x{:08x} -> 0x{:08x} (waits from now on)\n",
+				    entry->first, backing, gpu));
+			}
+		}
+		watched.unchanged = 0;
+	}
 }
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
