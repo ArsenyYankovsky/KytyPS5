@@ -39,12 +39,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <future>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <shared_mutex>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
@@ -165,14 +167,36 @@ void NoteShaderHostRead(void*, uint64_t shader_hash, uint32_t slot, uint64_t add
 		uint32_t host_use = 0;
 		uint64_t count    = 0;
 	};
+	// Per address, over the whole run: the 32 bytes (a texture descriptor's size) the backing held
+	// at each read, that is, as the previous read's download published them, and which bits of
+	// them changed between reads.
+	struct Bytes {
+		std::array<uint32_t, 8> last {};
+		std::array<uint32_t, 8> changed {};
+		uint64_t                changes = 0;
+		bool                    known   = false;
+	};
 	static std::mutex                                    mutex;
 	static std::map<std::pair<uint64_t, uint32_t>, Read> window;
+	static std::map<uint64_t, Bytes>                     values;
 	static auto                                          start = std::chrono::steady_clock::now();
 
 	std::scoped_lock lock(mutex);
 	auto&            read = window[{shader_hash, slot}];
 	read                  = {.address = address, .host_use = host_use, .count = read.count + 1};
-	const auto now        = std::chrono::steady_clock::now();
+	if (std::array<uint32_t, 8> bytes {};
+	    Libs::LibKernel::Memory::TryReadBacking(address, bytes.data(), sizeof(bytes))) {
+		auto& value = values[address];
+		if (value.known && value.last != bytes) {
+			value.changes++;
+			for (size_t i = 0; i < bytes.size(); i++) {
+				value.changed[i] |= value.last[i] ^ bytes[i];
+			}
+		}
+		value.last  = bytes;
+		value.known = true;
+	}
+	const auto now = std::chrono::steady_clock::now();
 	if (now - start < std::chrono::seconds(10)) {
 		return;
 	}
@@ -202,6 +226,20 @@ void NoteShaderHostRead(void*, uint64_t shader_hash, uint32_t slot, uint64_t add
 		}
 		text += fmt::format("srt-host-gpu-read: shader=0x{:016x} slot={} addr=0x{:x} n={} use={}\n",
 		                    key.first, key.second, entry.address, entry.count, uses);
+	}
+	std::set<uint64_t> addresses;
+	for (size_t i = 0; i < sorted.size() && i < 64; i++) {
+		addresses.insert(sorted[i].second.address);
+	}
+	for (const auto read_address: addresses) {
+		const auto found = values.find(read_address);
+		if (found == values.end()) {
+			continue;
+		}
+		const auto& value = found->second;
+		text += fmt::format(
+		    "srt-host-gpu-bytes: addr=0x{:x} changes={} now={:08x} changed-bits={:08x}\n",
+		    read_address, value.changes, fmt::join(value.last, " "), fmt::join(value.changed, " "));
 	}
 	Log::WriteToConsoleAndLog(text);
 }
