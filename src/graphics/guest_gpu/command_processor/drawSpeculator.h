@@ -117,6 +117,7 @@ private:
 		std::atomic<uint64_t> speculated {0};
 		std::atomic<uint64_t> behind {0};
 		std::atomic<uint64_t> taken {0};
+		std::atomic<uint64_t> current {0}; // Taken with reads_current.
 		std::atomic<uint64_t> missed {0};
 		std::atomic<uint64_t> mismatched {0};
 		std::atomic<uint64_t> deferred {0};

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -183,6 +184,9 @@ SpeculatedDraw* DrawSpeculator::Take(const uint32_t* packet) {
 	}
 	m_stats.taken.fetch_add(1, std::memory_order_relaxed);
 	slot.draw.reads_current = ReadsCurrent(slot.draw);
+	if (slot.draw.reads_current) {
+		m_stats.current.fetch_add(1, std::memory_order_relaxed);
+	}
 	return &slot.draw;
 }
 
@@ -240,7 +244,7 @@ void DrawSpeculator::Stop(uint64_t seq, uint64_t epoch, uint32_t opcode) {
 }
 
 void DrawSpeculator::PrintStats() {
-	std::string stops;
+	std::string                                    stops;
 	std::array<std::pair<uint64_t, uint32_t>, 256> ranked {};
 	for (uint32_t opcode = 0; opcode < 256; opcode++) {
 		ranked[opcode] = {m_stats.stops[opcode].load(std::memory_order_relaxed), opcode};
@@ -252,17 +256,20 @@ void DrawSpeculator::PrintStats() {
 		stops += text;
 	}
 	const auto failures = m_renderer.GetPipelineCache().SpeculationFailures();
-	std::printf("draw-speculator: draws=%" PRIu64 " restarts=%" PRIu64 " walked=%" PRIu64
-	            " speculated=%" PRIu64 " behind=%" PRIu64 " taken=%" PRIu64 " missed=%" PRIu64
-	            " mismatched=%" PRIu64 " deferred=%" PRIu64 " (unread %" PRIu64 ", unknown %" PRIu64
-	            ") stops:%s failures: predict=%" PRIu64
-	            " source=%" PRIu64 " unready=%" PRIu64 " refresh=%" PRIu64
-	            " (context %zu, shader %zu bytes)\n",
-	            m_gpu_seq, m_stats.restarts.load(), m_stats.walked.load(),
-	            m_stats.speculated.load(), m_stats.behind.load(), m_stats.taken.load(),
-	            m_stats.missed.load(), m_stats.mismatched.load(), m_stats.deferred.load(),
-	            m_stats.table_unread.load(), m_stats.table_unknown.load(), stops.c_str(), failures[0], failures[1], failures[2], failures[3],
-	            sizeof(HW::Context), sizeof(HW::Shader));
+	char       text[512];
+	std::snprintf(
+	    text, sizeof(text),
+	    "draw-speculator: draws=%" PRIu64 " restarts=%" PRIu64 " walked=%" PRIu64
+	    " speculated=%" PRIu64 " behind=%" PRIu64 " taken=%" PRIu64 " (reads current %" PRIu64
+	    ") missed=%" PRIu64 " mismatched=%" PRIu64 " deferred=%" PRIu64 " (unread %" PRIu64
+	    ", unknown %" PRIu64 ") stops:%s failures: predict=%" PRIu64 " source=%" PRIu64
+	    " unready=%" PRIu64 " refresh=%" PRIu64 " (context %zu, shader %zu bytes)\n",
+	    m_gpu_seq, m_stats.restarts.load(), m_stats.walked.load(), m_stats.speculated.load(),
+	    m_stats.behind.load(), m_stats.taken.load(), m_stats.current.load(), m_stats.missed.load(),
+	    m_stats.mismatched.load(), m_stats.deferred.load(), m_stats.table_unread.load(),
+	    m_stats.table_unknown.load(), stops.c_str(), failures[0], failures[1], failures[2],
+	    failures[3], sizeof(HW::Context), sizeof(HW::Shader));
+	Log::WriteToConsoleAndLog(text);
 }
 
 DrawSpeculator::Slot* DrawSpeculator::AcquireSlot(uint64_t seq, uint64_t epoch) {
