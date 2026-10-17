@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <deque>
 #include <fmt/format.h>
+#include <immintrin.h>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -970,6 +971,37 @@ static bool IsDispatchOpcode(uint32_t opcode) {
 	return opcode == Pm4::IT_DISPATCH_DIRECT || opcode == Pm4::IT_DISPATCH_INDIRECT;
 }
 
+// KYTY_DEBUG_GPU_DELAY_US=<n>: Thread_Gpu spins n microseconds before each draw and dispatch in
+// every other 20-second window, which the log marks. How much the frame time grows with the
+// added work tells how much the frame would gain if draw preparation got that much cheaper.
+static void DebugGpuThreadDelay() {
+	static const uint32_t delay_us = [] {
+		const char* text = std::getenv("KYTY_DEBUG_GPU_DELAY_US");
+		return text == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
+	}();
+	if (delay_us == 0 || !g_gpu_thread) {
+		return;
+	}
+	using Clock                   = std::chrono::steady_clock;
+	static const auto start       = Clock::now();
+	static int64_t    last_window = -1;
+	const auto        now         = Clock::now();
+	const auto window  = std::chrono::duration_cast<std::chrono::seconds>(now - start).count() / 20;
+	const bool delayed = window % 2 == 1;
+	if (window != last_window) {
+		last_window = window;
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "gpu-delay: {} us per draw and dispatch from now on\n", delayed ? delay_us : 0u));
+	}
+	if (!delayed) {
+		return;
+	}
+	const auto end = now + std::chrono::microseconds(delay_us);
+	while (Clock::now() < end) {
+		_mm_pause();
+	}
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	// KYTY_DEBUG_DRAW_PHASES: the time in each handler and between them (see Pm4OpTimer).
 	static const bool timed       = DrawPhaseTimer::Hash() != 0;
@@ -1054,6 +1086,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		const bool     draw     = IsDrawOpcode(opcode) || IsDispatchOpcode(opcode);
+		if (draw) {
+			DebugGpuThreadDelay();
+		}
 		const auto&    pipelines = m_renderer.GetPipelineCache();
 		const uint64_t pipelines_before =
 		    draw ? pipelines.GraphicsPipelinesCreated() + pipelines.ComputePipelinesCreated() : 0;
