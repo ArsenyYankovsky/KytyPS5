@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/command_processor/drawSpeculator.h"
 
 #include "common/assert.h"
+#include "common/cpuPlacement.h"
 #include "common/emulatorConfig.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -317,6 +318,7 @@ bool DrawSpeculator::WaitForGpu(uint64_t seq, uint64_t epoch) {
 
 void DrawSpeculator::Run() {
 	KYTY_PROFILER_THREAD("DrawSpeculator");
+	Common::CpuPlacement::PlaceCurrentThread(Common::CpuPlacement::Role::DrawSpeculator);
 	ShaderRecompiler::IR::t_resource_scratch_slot = 1;
 	auto shadow   = std::make_unique<CommandProcessor>(m_renderer, m_interrupt_event_id);
 	auto snapshot = std::vector<Cursor> {};
