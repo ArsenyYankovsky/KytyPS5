@@ -12,11 +12,9 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <deque>
 #include <map>
-#include <mutex>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -98,13 +96,6 @@ public:
 	// The range holds GPU-written bytes that a CPU read would wait for, and one cached buffer
 	// holds all of it (no image), so a GPU copy from that buffer reads them without waiting.
 	[[nodiscard]] bool IsGpuCopyableGpuWrite(uint64_t vaddr, uint64_t size);
-	// Thread_Gpu's shader-table reads (LibKernel::Memory::ReadGuestOnGpuThread) of GPU-dirty dwords
-	// that recent downloads always published unchanged: reads the backing's bytes without waiting
-	// and queues the download that keeps checking them. False: read and wait as before.
-	[[nodiscard]] bool TryReadUnchangedGpuWrite(uint64_t vaddr, void* data, uint64_t size);
-	// Thread_Gpu, before a shader-table read waits for GPU-dirty dwords: their downloads count from
-	// now on whether the GPU changed them.
-	void               WatchGpuWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
@@ -225,18 +216,6 @@ private:
 	};
 	std::array<CleanPage, 64> m_clean_pages {};
 	uint64_t                  m_gpu_dirty_generation = 1;
-	// Before a download publishes [address, address + size): whether the GPU's bytes of each
-	// watched dword equal the backing's. Priority-operation thread.
-	void CheckWatchedPublication(uint64_t address, const uint8_t* bytes, uint64_t size);
-	// Dwords of GPU-dirty shader tables that Thread_Gpu read (see TryReadUnchangedGpuWrite), keyed
-	// by their address.
-	struct WatchedDword {
-		uint8_t unchanged = 0;     // Downloads in a row that published the backing's bytes.
-		bool    banned    = false; // A prediction was wrong: never predicted again.
-	};
-	std::mutex                       m_watched_mutex;
-	std::map<uint64_t, WatchedDword> m_watched;
-	std::atomic_bool                 m_any_watched {false};
 	// ObtainBuffer's stream-ring copies of the current BDA epoch, by range (see there).
 	struct StreamCopy {
 		uint64_t vaddr        = 0;

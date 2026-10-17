@@ -128,8 +128,6 @@ const char* KindName(Kind kind) {
 		case Kind::StaleRead: return "stale-read";
 		case Kind::SrtGpuFill: return "srt-gpu-fill";
 		case Kind::SrtGpuFillCpu: return "srt-gpu-fill-cpu";
-		case Kind::SrtPredicted: return "srt-predicted";
-		case Kind::SrtPredictMiss: return "srt-predict-miss";
 		case Kind::Count: break;
 	}
 	return "?";
@@ -418,8 +416,7 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds, bool 
 			                    KindName(row.kind), ReasonName(row.reason), OpName(row.op),
 			                    row.count, ms, ms / static_cast<double>(row.count));
 		} else if (row.kind == Kind::OcclusionQuery || row.kind == Kind::OcclusionPredicate ||
-		           row.kind == Kind::GpuTimestamp || row.kind == Kind::StaleRead ||
-		           row.kind == Kind::SrtPredicted || row.kind == Kind::SrtPredictMiss) {
+		           row.kind == Kind::GpuTimestamp || row.kind == Kind::StaleRead) {
 			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} ({:.1f}/frame)\n", KindName(row.kind),
 			                    ReasonName(row.reason), OpName(row.op), row.count,
 			                    per(static_cast<double>(row.count)));
