@@ -471,6 +471,17 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 
+# Replays a recorded memory tracker call trace (see the tool's header); Windows only.
+if (WIN32)
+	add_executable(memory_trace_replay EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/MemoryTraceReplay.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/memoryTracker.cpp"
+	)
+	target_link_libraries(memory_trace_replay fmt::fmt common)
+	target_include_directories(memory_trace_replay PRIVATE ${inc_headers})
+endif()
+
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
